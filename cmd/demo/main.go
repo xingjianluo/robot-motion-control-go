@@ -22,6 +22,7 @@ import (
 	"github.com/xingjianluo/robot-motion-control-go/internal/protocol"
 	"github.com/xingjianluo/robot-motion-control-go/internal/report"
 	"github.com/xingjianluo/robot-motion-control-go/internal/safety"
+	"github.com/xingjianluo/robot-motion-control-go/internal/stream"
 	"github.com/xingjianluo/robot-motion-control-go/internal/trajectory"
 )
 
@@ -37,6 +38,8 @@ func main() {
 	drv := device.New(device.Config{
 		Version: protocol.V2, DT: period, Gain: 40, MaxVel: 2,
 		HardMin: -2, HardMax: 2, StartPos: 0,
+		// 连续流式轨迹使用带位置命令前馈的伺服模型跟踪（不影响单目标行为）。
+		PosCmdFeedforward: true, PosFFGain: 40,
 	}, fc, b)
 
 	ctl, err := control.New(control.Config{
@@ -56,6 +59,11 @@ func main() {
 			WatchdogTimeout: 35 * time.Millisecond, MaxStepRad: 1.0, MaxBackdateMs: 5,
 		},
 		Bus: bus.Config{Capacity: 16, Policy: bus.DropOldest, MaxAge: 200 * time.Millisecond},
+		Stream: control.StreamConfig{
+			Capacity: 32, FullPolicy: "reject_new", MinOverride: 0, MaxOverride: 2,
+		},
+		// 演示恢复必须以系统真实观测交叉核验为准，不能光信口头声明。
+		RequireObservedRecovery: true,
 	}, fc, b)
 	if err != nil {
 		panic(err)
@@ -146,7 +154,57 @@ func main() {
 		fmt.Println("  矛盾命令（预期）:", err)
 	}
 
-	header("6. 注入连续丢帧 => 看门狗判定‘暂时失联’(COMM_LOSS)，非跟踪误差")
+	header("6. 连续流式喂点：上一段没走完就续点，一路连续走完、不在点间停顿")
+	// 一次塞入三个点（各 0.2s，段速 0.5/1.0/0.5 rad/s），模拟手轮/示教
+	// 边动边喂。到达拼接点不停车，末点到后持续下发位置保持。
+	feedStream := func(pos float64, in time.Duration) {
+		if err := ctl.SubmitStreamPoint(stream.Point{
+			At: fc.Now().Add(in), PositionRad: pos,
+		}); err != nil {
+			panic(err)
+		}
+	}
+	feedStream(0.10, 200*time.Millisecond)
+	feedStream(0.30, 400*time.Millisecond)
+	feedStream(0.20, 600*time.Millisecond)
+	fmt.Printf("  已排队 %d 个流式点，开始连续推进...\n", ctl.StreamQueueLen())
+	for i := 0; i < 90; i++ {
+		tick("流式拼接")
+	}
+	s6 := ctl.Snapshot()
+	fmt.Printf("  流式结果: 到达点=%d 设备位置=%.3f (期望≈0.20) queued=%d\n  %s\n",
+		s6.StreamStats.Reached, drv.Position(), ctl.StreamQueueLen(), short(s6))
+
+	header("7. 在线速度倍率：50%->120%->暂停(0)->100%，越限倍率被明确拒绝")
+	feedStream(0.40, 300*time.Millisecond) // 段速≈0.67，倍率 2 => 1.33 可行
+	if err := ctl.SetSpeedOverride(3); err != nil {
+		fmt.Println("  倍率越界被拒（预期）:", err)
+	}
+	if err := ctl.SetSpeedOverride(0.5); err != nil {
+		panic(err)
+	}
+	for i := 0; i < 80; i++ {
+		switch i {
+		case 20:
+			if err := ctl.SetSpeedOverride(1.2); err != nil {
+				panic(err)
+			}
+		case 40:
+			if err := ctl.SetSpeedOverride(0); err != nil {
+				panic(err)
+			} // 暂停推进
+		case 55:
+			if err := ctl.SetSpeedOverride(1); err != nil {
+				panic(err)
+			} // 恢复
+		}
+		tick("在线倍率")
+	}
+	s7 := ctl.Snapshot()
+	fmt.Printf("  倍率结果: 当前倍率=%.2f 到达点=%d 设备位置=%.3f (期望≈0.40)\n  %s\n",
+		s7.StreamFactor, s7.StreamStats.Reached, drv.Position(), short(s7))
+
+	header("8. 注入连续丢帧 => 看门狗判定‘暂时失联’(COMM_LOSS)，非跟踪误差")
 	// 接下来 6 拍设备不产生帧：注入计划让总线丢弃（这里直接停发设备帧，
 	// 等价于链路中断；也可以用 bus.Inject 在 Post 侧丢帧）。
 	for i := 0; i < 5; i++ {
@@ -157,7 +215,7 @@ func main() {
 	}
 	fmt.Println("  失联状态:", short(ctl.Snapshot()))
 
-	header("7. 链路自愈后状态不得自动回 RUN；必须显式恢复")
+	header("9. 链路自愈后状态不得自动回 RUN；必须显式恢复（且需真实观测核验）")
 	for i := 0; i < 3; i++ {
 		tick("链路恢复")
 	}
@@ -167,7 +225,7 @@ func main() {
 	}
 	fmt.Println("  显式恢复后:", short(ctl.Snapshot()))
 
-	header("8. V2 力矩命令下发；随后驱动器上报超力矩 => TORQUE_FAULT 锁存")
+	header("10. V2 力矩命令下发；随后驱动器上报超力矩 => TORQUE_FAULT 锁存")
 	if _, err := ctl.SubmitCommand(trajectory.Command{Mode: protocol.ModeTorque, Torque: 2}); err != nil {
 		panic(err)
 	}
@@ -202,7 +260,7 @@ func main() {
 	}
 	fmt.Println("  人工确认恢复:", short(ctl.Snapshot()))
 
-	header("9. 急停与周期推进/命令提交并发：最终必须为 ESTOP 且无新命令")
+	header("11. 急停与周期推进/命令提交并发：最终必须为 ESTOP 且无新命令")
 	var wg sync.WaitGroup
 	wg.Add(3)
 	go func() {
@@ -234,7 +292,7 @@ func main() {
 	}
 	fmt.Println("  并发结束:", short(ctl.Snapshot()), " 急停后新增下行命令数=0 ✓")
 
-	header("10. 可观测性：总线统计、积压丢弃、注入丢帧与周期抖动")
+	header("12. 可观测性：总线统计、积压丢弃、注入丢帧与周期抖动")
 	snap := ctl.Snapshot()
 	fmt.Printf("  主链路 丢弃(满/陈旧): %d/%d  注入丢帧: %d  最大抖动: %v  抖动超限次数: %d\n",
 		snap.BusStats.DroppedFull, snap.BusStats.DroppedStale,

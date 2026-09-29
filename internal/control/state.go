@@ -7,6 +7,7 @@ import (
 	"github.com/xingjianluo/robot-motion-control-go/internal/fault"
 	"github.com/xingjianluo/robot-motion-control-go/internal/protocol"
 	"github.com/xingjianluo/robot-motion-control-go/internal/safety"
+	"github.com/xingjianluo/robot-motion-control-go/internal/stream"
 )
 
 // TrackingInfo 是跟踪误差观测；只有链路健康、样本被接受时才有意义。
@@ -54,4 +55,12 @@ type Snapshot struct {
 	FeedbackRejected int
 	BacklogRemaining int
 	LastFault        FaultRef
+
+	// 连续流式喂点 / 在线倍率观测（仅在流活动时有意义）。
+	StreamActive bool
+	StreamQueued int
+	StreamFactor float64
+	StreamStats  stream.Stats
+	// VerifiedRecovery 标记本次恢复是否通过“真实状态交叉核验”。
+	VerifiedRecovery bool
 }

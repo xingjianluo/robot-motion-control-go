@@ -23,6 +23,13 @@ type Config struct {
 	HardMax float64
 	// ReportTorqueV1 无意义（V1 线格式本就无 tau）；保留字段以显式表达。
 	StartPos float64
+	// PosCmdFeedforward 为 true 时，位置模式使用“相邻位置命令差分得到的
+	// 前馈速度 + 位置误差修正”，模拟带轨迹前馈的真实伺服，用于连续流式
+	// 轨迹的端到端跟踪；false（默认）保持历史的纯比例位置环行为，
+	// 不影响任何既有用法与测试。
+	PosCmdFeedforward bool
+	// PosFFGain 是前馈模式下位置误差修正项的增益（默认等于 Gain）。
+	PosFFGain float64
 }
 
 // Drive 是模拟驱动器。
@@ -38,6 +45,10 @@ type Drive struct {
 	fault   int
 	seq     uint64
 	lastCmd protocol.MotorCommand
+	// prevPosCmd / hasPrevPosCmd 用于位置命令速度前馈（相邻命令差分）。
+	prevPosCmd    float64
+	hasPrevPosCmd bool
+	prevPosCmdAt  time.Time
 	// 若解码器无法解释最新命令，记录原因（设备侧观测）。
 	lastDecodeIssue string
 }
@@ -74,6 +85,13 @@ func (d *Drive) Position() float64 {
 	return d.pos
 }
 
+// Velocity 返回当前模拟速度（测试断言用）。
+func (d *Drive) Velocity() float64 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.vel
+}
+
 // Tick 执行一拍：排空下行命令（取最新一条生效，其余标记积压丢弃的
 // 责任由总线容量策略承担），积分运动学，再发一帧状态。
 // 返回总线下发状态帧时的错误（例如注入丢帧），调用方可观测。
@@ -103,7 +121,32 @@ func (d *Drive) Tick() error {
 		d.lastCmd = *cmd
 		switch cmd.Mode {
 		case protocol.ModePosition:
-			d.vel = clamp(d.cfg.Gain*(cmd.PositionRad-d.pos), -d.cfg.MaxVel, d.cfg.MaxVel)
+			if d.cfg.PosCmdFeedforward {
+				ffGain := d.cfg.PosFFGain
+				if ffGain == 0 {
+					ffGain = d.cfg.Gain
+				}
+				if d.hasPrevPosCmd && cmd.PositionRad == d.prevPosCmd {
+					// 连续相同位置命令 = 显式位置保持：前馈速度为 0，
+					// 由位置误差修正把残余速度拉回（不产生差分伪前馈）。
+					d.vel = clamp(ffGain*(cmd.PositionRad-d.pos), -d.cfg.MaxVel, d.cfg.MaxVel)
+				} else {
+					// 前馈速度 = 相邻位置命令差分 / 命令时间差；
+					// 再叠加误差修正，模拟带轨迹前馈的伺服，稳态无差、
+					// 能平滑跟踪连续流式轨迹。
+					var ff float64
+					if d.hasPrevPosCmd && cmd.IssuedAt.After(d.prevPosCmdAt) {
+						ff = (cmd.PositionRad - d.prevPosCmd) / cmd.IssuedAt.Sub(d.prevPosCmdAt).Seconds()
+					}
+					corr := ffGain * (cmd.PositionRad - d.pos)
+					d.vel = clamp(ff+corr, -d.cfg.MaxVel, d.cfg.MaxVel)
+				}
+				d.prevPosCmd = cmd.PositionRad
+				d.prevPosCmdAt = cmd.IssuedAt
+				d.hasPrevPosCmd = true
+			} else {
+				d.vel = clamp(d.cfg.Gain*(cmd.PositionRad-d.pos), -d.cfg.MaxVel, d.cfg.MaxVel)
+			}
 		case protocol.ModeVelocity:
 			d.vel = cmd.VelocityRadS
 		case protocol.ModeTorque:

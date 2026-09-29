@@ -112,6 +112,15 @@ func FmtSnapshot(s control.Snapshot) string {
 		fmt.Fprintf(&b, " lastDrop=%s(seq=%d,dir=%s)", s.BusStats.LastDropReason, s.BusStats.LastDropSeq, s.BusStats.LastDropDir)
 	}
 	fmt.Fprintf(&b, "\n  jitter: last=%v max=%v breaches=%d", s.LastJitter, s.MaxJitter, s.JitterBreaches)
+	if s.StreamActive || s.StreamQueued > 0 {
+		fmt.Fprintf(&b, "\n  stream: active=%v queued=%d override=%.2f reached=%d appended=%d rejected=%d evicted=%d overrideRejects=%d",
+			s.StreamActive, s.StreamQueued, s.StreamFactor,
+			s.StreamStats.Reached, s.StreamStats.Appended, s.StreamStats.Rejected,
+			s.StreamStats.Evicted, s.StreamStats.OverrideRejects)
+		if s.StreamStats.LastEvent != "" {
+			fmt.Fprintf(&b, " lastEvent=%s", s.StreamStats.LastEvent)
+		}
+	}
 	if s.LastFault.Reason != "" {
 		fmt.Fprintf(&b, "\n  LAST_FAULT: %s", s.LastFault.String())
 	}

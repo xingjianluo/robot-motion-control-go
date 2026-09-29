@@ -31,6 +31,8 @@ const (
 	SourceFeedback   Source = "feedback"
 	SourceSafety     Source = "safety"
 	SourceController Source = "controller"
+	// SourceStream 连续流式喂点 / 在线速度倍率逻辑产生的拒绝。
+	SourceStream Source = "stream"
 )
 
 // Error 携带类别、来源组件、机器可判定的原因码与可读说明。
