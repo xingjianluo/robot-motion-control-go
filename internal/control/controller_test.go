@@ -13,6 +13,7 @@ import (
 	"github.com/xingjianluo/robot-motion-control-go/internal/protocol"
 	"github.com/xingjianluo/robot-motion-control-go/internal/report"
 	"github.com/xingjianluo/robot-motion-control-go/internal/safety"
+	"github.com/xingjianluo/robot-motion-control-go/internal/stream"
 	"github.com/xingjianluo/robot-motion-control-go/internal/trajectory"
 )
 
@@ -44,6 +45,10 @@ func newRig(t *testing.T, ver protocol.Version, busCfg bus.Config) *rig {
 		JitterTolerance: 15 * time.Millisecond,
 		MaxBacklog:      8,
 		TrajCapacity:    32,
+		StreamCapacity:  8,
+		StreamPolicy:    stream.PolicyRejectNew,
+		MinOverride:     0.01,
+		MaxOverride:     2.0,
 		Motion: trajectory.Limits{
 			MinPositionRad: -2, MaxPositionRad: 2,
 			MaxVelocityRadS: 2, MaxAccelRadS2: 100, MaxTorqueNm: 5,

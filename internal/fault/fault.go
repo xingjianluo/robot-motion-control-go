@@ -26,6 +26,7 @@ type Source string
 
 const (
 	SourceTrajectory Source = "trajectory"
+	SourceStream     Source = "stream"
 	SourceProtocol   Source = "protocol"
 	SourceBus        Source = "bus"
 	SourceFeedback   Source = "feedback"

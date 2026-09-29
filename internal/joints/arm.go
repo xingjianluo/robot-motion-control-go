@@ -9,6 +9,7 @@ import (
 	"github.com/xingjianluo/robot-motion-control-go/internal/control"
 	"github.com/xingjianluo/robot-motion-control-go/internal/fault"
 	"github.com/xingjianluo/robot-motion-control-go/internal/safety"
+	"github.com/xingjianluo/robot-motion-control-go/internal/stream"
 	"github.com/xingjianluo/robot-motion-control-go/internal/trajectory"
 )
 
@@ -119,6 +120,25 @@ func (a *Arm) Submit(joint string, cmd trajectory.Command) error {
 	}
 	_, err := c.SubmitCommand(cmd)
 	return err
+}
+
+// AppendStreamTarget 在指定关节追加流式目标（连续喂点）。返回因
+// evict_oldest 策略被挤掉的等待段，调用方可逐条留痕。
+func (a *Arm) AppendStreamTarget(joint string, t stream.Target) ([]stream.Eviction, error) {
+	c, ok := a.joints[joint]
+	if !ok {
+		return nil, fault.New(fault.CatCommandReject, fault.SourceController, "unknown_joint", joint)
+	}
+	return c.AppendStreamTarget(t)
+}
+
+// SetSpeedOverride 设置指定关节的在线速度倍率（1=100%）。
+func (a *Arm) SetSpeedOverride(joint string, scale float64) error {
+	c, ok := a.joints[joint]
+	if !ok {
+		return fault.New(fault.CatCommandReject, fault.SourceController, "unknown_joint", joint)
+	}
+	return c.SetSpeedOverride(scale)
 }
 
 // Snapshot 返回按挂载顺序排列的各关节快照。

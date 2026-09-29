@@ -279,7 +279,19 @@ func TestTorqueOverloadLatched(t *testing.T) {
 	if r.ctl.Snapshot().SafetyState != safety.StateTorqueFault {
 		t.Fatalf("want TORQUE_FAULT, got %s", r.ctl.Snapshot().SafetyState)
 	}
-	// 缺人工确认 => 恢复被拒
+	// 仅凭口头声称“力矩已正常”、真实最新证据仍是 9Nm =>
+	// 必须以 recovery_evidence_contradicted 拒绝（不能光信调用方声明）。
+	if err := r.ctl.Recover(fullRecover(true)); err == nil {
+		t.Fatal("recovery with torque claim contradicted by observed sample must be denied")
+	} else {
+		mustReason(t, err, "recovery_evidence_contradicted")
+	}
+	// 让设备继续上报真实健康样本（力矩正常、位置在限内、故障码清零），
+	// 恢复条件必须按系统当时的真实状态判定。
+	for i := 0; i < 2; i++ {
+		r.tick()
+	}
+	// 缺人工确认 => 恢复被拒（此时证据已不矛盾，拒绝原因回到 recovery_denied）
 	c := fullRecover(true)
 	c.OperatorAck = false
 	mustReason(t, r.ctl.Recover(c), safety.ReasonRecoveryDenied)

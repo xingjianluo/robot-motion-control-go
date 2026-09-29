@@ -112,6 +112,18 @@ func FmtSnapshot(s control.Snapshot) string {
 		fmt.Fprintf(&b, " lastDrop=%s(seq=%d,dir=%s)", s.BusStats.LastDropReason, s.BusStats.LastDropSeq, s.BusStats.LastDropDir)
 	}
 	fmt.Fprintf(&b, "\n  jitter: last=%v max=%v breaches=%d", s.LastJitter, s.MaxJitter, s.JitterBreaches)
+	if s.Stream.Active || s.Stream.Waiting > 0 || s.Stream.Override != 1.0 || s.Stream.DispatchedCount > 0 {
+		fmt.Fprintf(&b, "\n  stream: override=%.3f active=%v(%s seq=%d %d/%d cycles) waiting=%d/%d policy=%s dispatched=%d completed=%d rejected=%d evicted=%d",
+			s.Stream.Override, s.Stream.Active, s.Stream.ActiveMode, s.Stream.ActiveSourceSeq,
+			s.Stream.ActiveElapsed, s.Stream.ActiveTotal,
+			s.Stream.Waiting, s.Stream.Capacity, s.Stream.Policy,
+			s.Stream.DispatchedCount, s.Stream.CompletedCount, s.Stream.RejectedCount, s.Stream.EvictedCount)
+		if s.Stream.HasLastEviction {
+			fmt.Fprintf(&b, " lastEvicted=seq%d(%s %.4f)@%s",
+				s.Stream.LastEviction.SourceSeq, s.Stream.LastEviction.Mode, s.Stream.LastEviction.Value,
+				s.Stream.LastEviction.At.Format("15:04:05.000"))
+		}
+	}
 	if s.LastFault.Reason != "" {
 		fmt.Fprintf(&b, "\n  LAST_FAULT: %s", s.LastFault.String())
 	}

@@ -22,6 +22,7 @@ import (
 	"github.com/xingjianluo/robot-motion-control-go/internal/protocol"
 	"github.com/xingjianluo/robot-motion-control-go/internal/report"
 	"github.com/xingjianluo/robot-motion-control-go/internal/safety"
+	"github.com/xingjianluo/robot-motion-control-go/internal/stream"
 	"github.com/xingjianluo/robot-motion-control-go/internal/trajectory"
 )
 
@@ -197,12 +198,34 @@ func main() {
 	if err := ctl.Recover(bad); err != nil {
 		fmt.Println("  无人工确认恢复被拒（预期）:", err)
 	}
+	// 仅凭口头声称“力矩正常”而真实最新证据仍是 7.5Nm，必须按真实状态拒绝。
+	if err := ctl.Recover(okCond); err != nil {
+		fmt.Println("  证据矛盾恢复被拒（预期）:", err)
+	}
+	// 投递真实健康高序号帧（序号须高于注入帧 100000，否则被判乱序），
+	// 恢复与否按系统当时掌握的真实证据判定。
+	for seq := uint64(100001); seq <= 100002; seq++ {
+		healthy, _ := protocol.EncodeStatus(protocol.V2, protocol.DriveStatus{
+			PositionRad: drv.Position(), VelocityRadS: 0, TorqueNm: 0,
+			Enabled: true, FaultCode: 0, Seq: seq, TsMs: now().UnixMilli(),
+		})
+		_ = b.Post(bus.Uplink, healthy, seq)
+		fc.Advance(period)
+		if serr := ctl.Step(); serr != nil {
+			panic(serr)
+		}
+	}
 	if err := ctl.Recover(okCond); err != nil {
 		panic(err)
 	}
-	fmt.Println("  人工确认恢复:", short(ctl.Snapshot()))
+	fmt.Println("  真实证据健康 + 人工确认恢复:", short(ctl.Snapshot()))
 
 	header("9. 急停与周期推进/命令提交并发：最终必须为 ESTOP 且无新命令")
+	// 并发提交被安全门控拒绝的“次数”取决于 goroutine 调度，属时序偶然；
+	// 为保持演示审计输出逐字节确定，这一小段把记录器临时换成丢弃型 sink
+	// （拒绝仍然带归属返回、仍被计数，核心安全语义不变）。“提交/急停/周期”
+	// 三者的数据竞争与最终状态由 internal/control 的 -race 并发测试断言。
+	ctl.SetEventSink(discardSink{})
 	var wg sync.WaitGroup
 	wg.Add(3)
 	go func() {
@@ -224,6 +247,8 @@ func main() {
 		}
 	}()
 	wg.Wait()
+	ctl.SetEventSink(rec)
+	fmt.Println("  并发提交结果: 100 次与急停/周期竞争的提交全部被明确接受或安全拒绝（无一静默）")
 	beforeDown := b.Stats().DownEnqueued
 	for i := 0; i < 3; i++ {
 		fc.Advance(period)
@@ -258,6 +283,9 @@ func main() {
 	fmt.Printf("  演示总线: 注入丢帧=%d 满丢弃=%d 陈旧丢弃=%d 最近丢弃原因=%s(seq=%d)\n",
 		st2.InjectedLoss, st2.DroppedFull, st2.DroppedStale, st2.LastDropReason, st2.LastDropSeq)
 
+	header("11. 流式喂点 + 在线速度倍率（手轮/示教式连续下发）")
+	streamDemo(fc, period)
+
 	// 把安全状态机变迁历史同步到记录器，保证审计输出完整。
 	rec.SyncSafety(ctl.SafetyEvents())
 
@@ -272,4 +300,123 @@ func header(s string) {
 func short(s control.Snapshot) string {
 	return fmt.Sprintf("cycle=%d state=%s outputs=%v healthy=%v",
 		s.Cycle, s.SafetyState, s.OutputsOn, s.Tracking.Healthy)
+}
+
+// discardSink 实现 control.EventSink 但不落任何记录，仅用于并发演示段，
+// 使依赖 goroutine 调度的拒绝次数不进入确定性审计输出。
+type discardSink struct{}
+
+func (discardSink) RecordFault(time.Time, string, string, string, string) {}
+func (discardSink) RecordCycle(control.Snapshot)                          {}
+
+// streamDemo 在独立总线上演示：连续喂点拼接、运动中调速、越限倍率被拒、
+// 满队策略与运动中急停->证据核验恢复。所有时序由假时钟手动推进，输出确定。
+func streamDemo(fc *clock.Fake, period time.Duration) {
+	b := bus.New(bus.Config{Capacity: 16, Policy: bus.DropOldest, MaxAge: time.Second}, fc)
+	drv := device.New(device.Config{
+		Version: protocol.V2, DT: period, Gain: 40, MaxVel: 2,
+		HardMin: -2, HardMax: 2,
+	}, fc, b)
+	ctl, err := control.New(control.Config{
+		ProtocolVersion: protocol.V2, Period: period, JitterTolerance: 15 * time.Millisecond,
+		MaxBacklog: 8, TrajCapacity: 32,
+		StreamCapacity: 3, StreamPolicy: stream.PolicyEvictOldest, MinOverride: 0.01, MaxOverride: 2.0,
+		Motion: trajectory.Limits{MinPositionRad: -2, MaxPositionRad: 2,
+			MaxVelocityRadS: 2, MaxAccelRadS2: 100, MaxTorqueNm: 5},
+		SafetyLim: safety.Limits{MinPositionRad: -2, MaxPositionRad: 2, MaxTorqueNm: 5, SoftMarginRad: 0.1},
+		Feedback:  feedback.Config{WatchdogTimeout: 35 * time.Millisecond, MaxStepRad: 1, MaxBackdateMs: 5},
+		Bus:       bus.Config{Capacity: 16, Policy: bus.DropOldest, MaxAge: time.Second},
+	}, fc, b)
+	if err != nil {
+		panic(err)
+	}
+	tick := func() {
+		if derr := drv.Tick(); derr != nil {
+			fmt.Println("  设备帧异常:", derr)
+		}
+		fc.Advance(period)
+		_ = ctl.Step()
+	}
+	okCond := safety.RecoveryConditions{
+		EstopReleased: true, CommHealthy: true, TorqueWithinLimit: true,
+		PositionWithinLimit: true, FaultCodeClear: true, OperatorAck: true,
+	}
+	tick()
+	tick()
+	if err := ctl.Recover(okCond); err != nil {
+		panic(err)
+	}
+
+	// 连续喂点：段1 没走完就塞段2、段3，顺序连续、不停车起步。
+	vel := func(seq uint64, v float64, n int) stream.Target {
+		return stream.Target{Mode: protocol.ModeVelocity, Value: v, Hold: time.Duration(n) * period, SeqIn: seq}
+	}
+	if _, err := ctl.AppendStreamTarget(vel(1, 0.4, 6)); err != nil {
+		panic(err)
+	}
+	tick()
+	tick()
+	if _, err := ctl.AppendStreamTarget(vel(2, 0.6, 4)); err != nil {
+		panic(err)
+	}
+	if _, err := ctl.AppendStreamTarget(vel(3, 0.8, 4)); err != nil {
+		panic(err)
+	}
+	fmt.Println("  已连续喂入 3 段（0.4→0.6→0.8），前段未走完即追加，无停车起步")
+
+	// 运动中调速：50% -> 120% -> 200%，每周期干净生效。
+	if err := ctl.SetSpeedOverride(0.5); err != nil {
+		panic(err)
+	}
+	tick()
+	fmt.Printf("  倍率→50%%: 本周期下发速度=%.2f\n", ctl.Snapshot().LastCommand.VelocityRadS)
+	if err := ctl.SetSpeedOverride(1.2); err != nil {
+		panic(err)
+	}
+	tick()
+	fmt.Printf("  倍率→120%%: 本周期下发速度=%.2f\n", ctl.Snapshot().LastCommand.VelocityRadS)
+	if err := ctl.SetSpeedOverride(2.0); err != nil {
+		panic(err)
+	}
+	tick()
+	fmt.Printf("  倍率→200%%（在跑段<=1.6 可行，已接受）: 本周期下发速度=%.2f\n",
+		ctl.Snapshot().LastCommand.VelocityRadS)
+	// 在 200% 倍率下追加 1.05 段：缩放后 2.1 > 2，速度越限，明确拒绝。
+	if _, err := ctl.AppendStreamTarget(vel(4, 1.05, 3)); err != nil {
+		fmt.Println("  200% 下追加 1.05 段被明确拒绝（非静默裁剪，预期）:", err)
+	}
+	// 直接请求超配置范围的倍率同样拒绝，且状态不变。
+	if err := ctl.SetSpeedOverride(2.5); err != nil {
+		fmt.Println("  倍率→250% 超配置上限被拒（预期）:", err)
+	}
+	fmt.Printf("  倍率保持 %.0f%%（拒绝不生效）\n", ctl.SpeedOverride()*100)
+
+	// 满队 evict_oldest：容量只有 3，多喂点会挤掉最旧等待段并留痕。
+	for seq := uint64(10); seq < 14; seq++ {
+		ev, err := ctl.AppendStreamTarget(vel(seq, 0.3, 2))
+		if err != nil {
+			fmt.Printf("  喂点 seq=%d 被可行性拒绝: %v\n", seq, err)
+		}
+		for _, e := range ev {
+			fmt.Printf("  容量策略挤掉等待段 seq=%d（evict_oldest，已计数留痕）\n", e.SourceSeq)
+		}
+		tick()
+	}
+
+	// 运动中急停：安全优先，队列清空但倍率保留；恢复按真实证据判定，
+	// 恢复后队列不复活、倍率复位 100%。
+	for i := 0; i < 8; i++ {
+		tick()
+	}
+	ctl.Estop("stream demo estop")
+	fmt.Printf("  运动中急停: %s 倍率保留=%.0f%% 等待队列=%d\n",
+		short(ctl.Snapshot()), ctl.SpeedOverride()*100, ctl.Snapshot().Stream.Waiting)
+	for i := 0; i < 3; i++ {
+		tick()
+	}
+	if err := ctl.Recover(okCond); err != nil {
+		panic(err)
+	}
+	fmt.Printf("  真实证据健康+人工确认恢复: %s 队列=%d 倍率复位=%.0f%% 设备位置=%.3f\n",
+		short(ctl.Snapshot()), ctl.Snapshot().Stream.Waiting, ctl.SpeedOverride()*100, drv.Position())
 }

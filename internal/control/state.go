@@ -54,4 +54,7 @@ type Snapshot struct {
 	FeedbackRejected int
 	BacklogRemaining int
 	LastFault        FaultRef
+	// Stream 是流式喂点/在线速度倍率的可观测状态（纯增量字段，
+	// 不影响原有快照读取方）。
+	Stream StreamInfo
 }

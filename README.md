@@ -67,6 +67,7 @@ go test ./internal/control/ -run TestExplainableDecisionFlow -v
 | `internal/protocol` | V1/V2 帧编解码；未知帧/缺字段/版本不支持各自独立归类 |
 | `internal/bus` | 有界双工队列、`drop_oldest/newest`、MaxAge 陈旧淘汰、故障注入 |
 | `internal/trajectory` | 位置/速度/力矩命令的限位、矛盾校验、加速度连续性、有界轨迹缓冲 |
+| `internal/stream` | 流式喂点段播放器：FIFO 连续拼接、有界等待队列与溢出策略、在线速度倍率原子生效 |
 | `internal/feedback` | 反馈分类：接受/重复/乱序/跳变/陈旧；看门狗区分“失联 vs 偏差” |
 | `internal/safety` | 优先级联锁状态机 + 软限位/力矩/故障码监视器；显式恢复条件 |
 | `internal/control` | 组合各组件，**一把锁**串行化提交/急停/恢复/周期，输出完整快照 |
@@ -110,8 +111,9 @@ go test ./internal/control/ -run TestExplainableDecisionFlow -v
    异常帧**不更新**连续性基准。
 3. **看门狗**：超过 `WatchdogTimeout` 无有效帧 ⇒ 触发 `COMM_LOSS`
    （`communication_fault`，**不是**跟踪误差）。
-4. **安全门控**：仅 `OutputsEnabled()` 时推进轨迹、编码并投递命令；
-   非 RUN 状态清空待发航点。
+4. **安全门控**：仅 `OutputsEnabled()` 时推进轨迹、编码并投递命令
+   （旧版单目标通道与流式段播放器在同一把锁下按互斥通道推进）；
+   非 RUN 状态清空待发航点与未走完的流式段并留痕（见 4A.6）。
 5. 生成并上报**完整快照**（安全状态、输出、跟踪、总线统计、最近故障）。
 
 ### 3.3 并发正确性
@@ -159,6 +161,138 @@ go test ./internal/control/ -run TestExplainableDecisionFlow -v
   而不是并存或报错。
 - 协议层不兼容（如 V1 上请求力矩模式）在命令**入口**即以
   `protocol_error|version_unsupported` 拒绝，不会先入缓冲再在周期内失败。
+
+---
+
+## 4A. 流式喂点与在线速度倍率（手轮/示教式）
+
+在第 4 节“单目标、逐周期”能力之上，系统新增一条**流式轨迹通道**
+（`internal/stream` + `Controller.AppendStreamTarget / SetSpeedOverride`），
+面向产线调试中“一边运动一边不停喂点、运行中随时整体调快调慢”的用法。
+
+### 4A.1 怎么用
+
+```go
+// target 带一个“标称保持时长”（倍率=1 时持续多久），按控制周期
+// 四舍五入量化为整周期数，至少 1 个周期；Hold==0 表示恰好 1 个周期。
+ctl.AppendStreamTarget(stream.Target{Mode: protocol.ModeVelocity, Value: 0.4, Hold: 60ms, SeqIn: 1})
+// 上一段还没走完就可以接着塞；播放器严格按提交顺序首尾相接连续执行，
+// 段与段之间不会“到点停车再起步”。
+ctl.AppendStreamTarget(stream.Target{Mode: protocol.ModeVelocity, Value: 0.6, Hold: 40ms, SeqIn: 2})
+
+// 运动中随时整体调速（1=100%）；对“正在走的段”和“后面排队的段”同时生效。
+ctl.SetSpeedOverride(0.5)  // 调到 50%
+ctl.SetSpeedOverride(1.2)  // 再调到 120%
+```
+
+- **速度段**：每周期下发 `命令速度 × 倍率`；倍率越大，速度越高、段走完
+  所需周期数越少（`有效周期数 ≈ 标称周期数 / 倍率`，至少 1 个周期）。
+- **位置段**：每周期在 `[起点, 目标位置]` 间线性插值；倍率只改变“走完
+  这段的时间/插值步长”，**最终到达的目标位置不变**，最后一个周期精确
+  落在目标点。起点取系统真实状态：优先最近一条被接受反馈位置，位置段
+  之间沿目标链推算，保证拼接连续。
+- **力矩段**：倍率是“快慢”，不是“出力大小”，因此**力矩幅值不被缩放**，
+  只有保持时长随倍率伸缩。
+- 多关节同样可用：`arm.AppendStreamTarget(joint, target)`、
+  `arm.SetSpeedOverride(joint, scale)`。
+
+### 4A.2 干净的周期语义
+
+调速、喂点、周期推进都走控制器的**同一把锁**。倍率的生效点固定在两个
+控制周期之间：`Step` 在同一个临界区里读倍率 → 推进播放器 → 编码 →
+投递。因此**一个周期内从头到尾只使用一个倍率**，绝不可能出现“这周期
+一半旧倍率、一半新倍率”。播放器下发序号在其生命周期内严格单调。
+
+### 4A.3 重叠 / 中途插入 / 时间语义，说清楚
+
+- 流式通道是**纯顺序 FIFO**：新目标总是接到队尾，按提交顺序执行，
+  **不支持按时间戳中途插队**，也没有“与上一段时间重叠”的概念——每个
+  `Target` 描述的是“从上一段结束处开始、持续 `Hold` 时长的一段”，
+  因此提前喂入只是提前排队，绝不会覆盖或顶掉正在走的动作。
+- 段时长是**相对时长**（`Hold`），不是绝对执行时刻；无需与时钟对齐，
+  也就不存在时间戳重叠/倒流要悄悄丢点的情况（这与第 4 节旧版按绝对
+  `IssuedAt` 的轨迹缓冲刻意区分）。
+- **跨模式不能在同一条流里拼接**：在跑/排队是速度流时追加位置目标会被
+  `stream_mode_mismatch` 拒绝；要换模式必须先让当前流走空（回到空闲）。
+
+### 4A.4 连续性与安全边界（不可行就明确拒，绝不伪装）
+
+每次喂点和每次调速都按**当前真实状态**做完整可行性核算，原因码可与普通
+越界区分（类别恒为 `command_rejected`，来源 `stream`）：
+
+| 原因码 | 触发条件 |
+|--------|----------|
+| `stream_invalid_segment` | 未知模式；`Hold<0`；非零 `Hold` 量化为 0 个周期（短于半个周期） |
+| `stream_target_position_out_of_limit` | 位置目标超出**硬**位置范围 |
+| `stream_target_soft_limit` | 位置目标落入软限位带外（硬限位内） |
+| `stream_target_velocity_out_of_limit` | 速度目标按当前倍率缩放后 `>最大速度` |
+| `stream_target_torque_out_of_limit` | 力矩目标超力矩上限（幅值不缩放） |
+| `stream_interpolation_step_too_fast` | 位置段每周期插值步长对应的速度超速 |
+| `stream_splice_accel_out_of_limit` | 相邻两段（含静止→首段）轮廓速度跳变所需加速度超限 |
+| `stream_override_out_of_range` | 倍率非正/NaN 或超出配置的 `[MinOverride,MaxOverride]` |
+| `stream_overflow_reject_new` | 等待队列已满且策略为 `reject_new` |
+| `stream_segment_infeasible_now` | 段在**激活瞬间**按真实状态判定走不出来（如位置段无任何位置基准） |
+
+- **调速是原子的**：`SetSpeedOverride` 会用候选倍率把“在跑段 + 所有排队
+  段”整体重新核算一遍；任一段会越速度/插值步长/拼接加速度边界，就整体
+  拒绝，播放器状态与倍率**保持不变**，绝不半应用。
+- 极少数“入队时无法核算、只能在激活瞬间判定”的段（例如前面隔着速度段、
+  位置起点在激活前未知）走**固定规则**：激活时按真实参考位置复核，仍不可
+  行就丢弃该段、计数并以 `stream_segment_infeasible_now` 留痕，然后继续
+  执行后续段——**绝不静默丢点**。
+- 控制器入口另有两条**通道互斥**原因，保护与旧版用法的确定边界：
+  旧轨迹未排空时喂点 → `legacy_trajectory_busy`；流式段未走完时发旧版
+  单目标 → `stream_active`。
+
+### 4A.5 排队容量与溢出策略（内存永远有界）
+
+容量只计**等待队列**（不含正在执行的那一段），由
+`Config.StreamCapacity` 限定，`Config.StreamPolicy` 决定满时行为：
+
+| 策略 | 满时行为 |
+|------|----------|
+| `reject_new`（默认） | 拒绝新目标，返回 `stream_overflow_reject_new`；已排队动作一个不动 |
+| `evict_oldest` | 挤掉等待队列中**最旧**的段以接纳新目标；**正在执行的段永不被挤** |
+
+每次挤兑都返回被挤段（`[]stream.Eviction`）、计入 `EvictedCount`、
+记录最近一次挤兑（序号/模式/值/时刻），并在控制器侧写成带归属的故障流
+（`stream_waiting_evicted`）。快照 `Snapshot.Stream` 暴露
+`Waiting/Capacity/Override/Dispatched/Completed/Rejected/Evicted/...`，
+全部可观测。
+
+### 4A.6 与安全状态、恢复的互动
+
+- **安全优先**：非 `RUN` 状态下喂点一律以
+  `safety|controller|outputs_disabled` 拒绝；调速在停机期间可预调，但
+  此时没有段在执行。
+- 任意安全停机（急停 / 通信失联 / 力矩故障 / 软限位）在周期门控处清空
+  旧版待发航点与未走完的流式段，并分别记录
+  `safety|controller|legacy_trajectory_purged`、
+  `safety|controller|stream_motion_purged`——**停机导致的丢点可观测、
+  可复现，不是静默丢点**。
+- **停机后**：操作员设置的**速度倍率保留**（属于调试输入，不是运动内容）；
+  **未走完的队列清空**。
+- **显式恢复后**：队列**不复活**（不会把停机前没走完的动作突然冲出去）、
+  连续性记忆/反馈基准清空、**倍率复位 100%**（全新运动上下文）；播放器的
+  *下发序号不复位*，避免线上序号回退被对端判成重复/乱序。
+- **恢复按真实状态判定**：`Recover` 除了校验调用方给的
+  `RecoveryConditions`，还用系统当时掌握的**真实反馈证据**交叉核验。
+  声称与证据矛盾（如口头说力矩正常但最新样本仍超力矩、说故障码清零但
+  真实仍有故障码、说通信健康但链路仍处于失联）即以
+  `safety|controller|recovery_evidence_contradicted` 拒绝并逐条列出矛盾项；
+  系统从未见过该类证据时不臆断，交回显式条件判定。没有静默恢复、没有
+  静默丢点。
+
+### 4A.7 与原有用法 / 协议版本的兼容
+
+- 旧版 `SubmitCommand`、轨迹缓冲、V1/V2 协议、既有拒绝顺序与状态机
+  **全部保持不变**；流式能力是纯增量，默认配置即可工作（容量/倍率范围
+  有内置默认值）。
+- 流式下发的仍是标准 `CMD` 帧（位置/速度/力矩），因此 **V1 控制器上
+  请求流式力矩目标同样在入口以 `version_unsupported` 拒绝**；V1/V2
+  共存、字段缺失等协议语义不因本特性改变。
+- 旧版单目标通道与流式通道**互斥**（见 4A.4），避免两套轮廓在同一关节上
+  产生不确定拼接；一条流走空后旧版用法立即可用。
 
 ---
 
@@ -230,13 +364,15 @@ go test ./internal/control/ -run TestExplainableDecisionFlow -v
 
 | Category | 含义 | 典型原因码 |
 |----------|------|-----------|
-| `command_rejected` | 命令主动被拒（越界/矛盾/不安全） | `position_out_of_limit`、`accel_out_of_limit` … |
+| `command_rejected` | 命令主动被拒（越界/矛盾/不安全） | `position_out_of_limit`、`accel_out_of_limit`、`stream_*` … |
 | `protocol_error` | 帧到达但协议不接受 | `unknown_frame_type`、`missing_field`、`version_unsupported` … |
 | `communication_fault` | 链路问题 | `feedback_watchdog_timeout`、`queue_full_dropped`、`injected_frame_loss`、`position_jump` … |
-| `safety` | 安全联锁触发或恢复被拒 | `estop_pressed`、`torque_overload`、`recovery_denied` … |
+| `safety` | 安全联锁触发或恢复被拒 | `estop_pressed`、`torque_overload`、`recovery_denied`、`recovery_evidence_contradicted`、`stream_motion_purged` … |
 
-`Source` 进一步指明首次产生组件（trajectory/protocol/bus/feedback/
-safety/controller）。测试依据**稳定原因码**断言，而不依赖错误文案。
+`Source` 进一步指明首次产生组件（trajectory/**stream**/protocol/bus/
+feedback/safety/controller）。流式相关拒绝的来源恒为 `stream`（控制器侧
+通道互斥/安全清空为 `controller`），测试依据**稳定原因码**断言，而不依赖
+错误文案。
 
 ---
 
@@ -254,6 +390,15 @@ make test           # 等价：go test ./... -race -count=1
 - **协议**：V1/V2 往返、缺字段、未知帧、版本不支持、编码确定性；
 - **总线**：两种丢弃策略、陈旧淘汰、丢帧/重复/损坏注入的归属；
 - **轨迹**：各类拒绝原因、加速度连续性、时间戳单调、缓冲有界；
+- **流式播放器**（`internal/stream`）：段拼接无空周期、位置插值落点精确、
+  倍率对在跑/排队段同时生效且单周期干净、越限/越加速倍率原子拒绝、
+  力矩幅值不被缩放、reject_new/evict_oldest 容量策略、Clear/Reset 语义；
+- **流式控制场景**（`internal/control/stream_scenarios_test.go`）：
+  S1 拼接连续性、S2 在线倍率单周期干净、S3 越限倍率拒绝原因可区分、
+  S4/S5 排队上限两种策略与挤兑留痕、S6 运动调速中急停→证据核验恢复
+  （谎报被 `recovery_evidence_contradicted` 拒、恢复后队列不复活/倍率复位）、
+  S7 Step/喂点/调速/急停并发（300×竞争 + race）、S8 与旧版通道互斥、
+  S9 位置流插值与三类位置拒绝；关键用例打印**输入/判定依据/最终状态**；
 - **反馈**：重复/乱序/跳变不污染基准、看门狗“失联≠偏差”、V1 兼容；
 - **安全**：优先级与抑制、急停恒赢、恢复条件全列举、软限位显式清除；
 - **控制器场景**（`internal/control/scenarios_test.go`）：
@@ -268,13 +413,30 @@ make test           # 等价：go test ./... -race -count=1
 make demo
 ```
 
-10 个场景顺序演示：上电 ESTOP 拒绝命令 → 条件不全拒绝恢复 → 满足条件+人工
+11 个场景顺序演示：上电 ESTOP 拒绝命令 → 条件不全拒绝恢复 → 满足条件+人工
 确认 → 连续速度轨迹与反馈闭环（1 rad/s×0.3s=0.3 rad，误差 0）→
 越界/矛盾命令被区分拒绝 → 连续丢帧触发看门狗 COMM_LOSS → 链路自愈不自动
 复位 → 显式恢复 → 力矩超限 TORQUE_FAULT 锁存 → 缺人工确认被拒 → 恢复 →
-急停与周期/命令并发（最终必为 ESTOP 且无新命令）→ 积压/注入/抖动可观测性。
+急停与周期/命令并发（最终必为 ESTOP 且无新命令）→ 积压/注入/抖动可观测性 →
+**流式连续喂点与在线倍率**（前段未走完即续点、50%/120%/200% 调速、越限倍率
+与超范围倍率被明确拒绝、evict_oldest 挤兑留痕、运动中急停后按真实证据恢复且
+倍率复位）。
 
-### 9.3 确定性与无外部依赖说明
+### 9.3 单独稳定复现流式特性
+
+```bash
+# 播放器纯逻辑（拼接/倍率/容量，无需设备）
+go test ./internal/stream/ -race -count=1 -v
+# 控制器级流式场景 S1~S9（含并发竞态、安全停机与证据恢复）
+go test ./internal/control/ -run TestStream -race -count=1 -v
+# 端到端演示的第 11 段
+go run ./cmd/demo
+```
+
+所有用例只依赖确定性假时钟与进程内模拟总线/设备，无网络、无文件、无真实
+凭据，重复运行结论逐次一致。
+
+### 9.4 确定性与无外部依赖说明
 
 - 所有时间来自 `clock.Fake`（手动 `Advance`），不依赖墙钟与 goroutine
   调度时序；并发用例验证的是**锁保证的最终状态**，而非时序巧合。
@@ -290,7 +452,10 @@ make demo
 | `Period` | 控制周期（演示为 10ms） |
 | `JitterTolerance` | 周期抖动告警阈值，超限计入 `JitterBreaches` |
 | `MaxBacklog` | 单周期最多消费的上行帧数 |
-| `TrajCapacity` | 轨迹缓冲容量（满则拒绝，不无界增长） |
+| `TrajCapacity` | 旧版轨迹缓冲容量（满则拒绝，不无界增长） |
+| `StreamCapacity` | 流式等待队列容量（不含正在执行的段；<=0 按 16） |
+| `StreamPolicy` | 流式满队策略：`reject_new`（默认）/`evict_oldest` |
+| `MinOverride` / `MaxOverride` | 在线速度倍率允许范围（1=100%；默认 1%~200%） |
 | `Motion` | 位置范围、最大速度/加速度/力矩 |
 | `SafetyLim` | 硬限位、力矩上限、软限位余量 `SoftMarginRad` |
 | `Feedback` | 看门狗超时、最大可信单步位移、允许时间戳回退 |
