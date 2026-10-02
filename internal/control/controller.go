@@ -42,6 +42,10 @@ const (
 	ReasonStreamEvicted = "stream_evicted_oldest"
 	// ReasonStreamDrained 一段流式喂点全部走完（可观测事件）。
 	ReasonStreamDrained = "stream_drained"
+	// ReasonStreamReleasedByCommand 一条单目标命令被成功接受，流式通路
+	// （含排空后的末点保持/未走完排队）显式退出，下发权交回单目标通路。
+	// 属正常模式切换的可观测事件，不是拒绝、不是安全动作。
+	ReasonStreamReleasedByCommand = "stream_released_by_command"
 	// ReasonRecoveryObservedMismatch 调用方声称的恢复条件与系统真实
 	// 观测相矛盾（不能光信口头声明）。
 	ReasonRecoveryObservedMismatch = "recovery_conditions_contradict_observation"
@@ -207,6 +211,25 @@ func (c *Controller) SubmitCommand(cmd trajectory.Command) (protocol.MotorComman
 	if err := c.traj.Append(trajectory.BufferedPoint{Setpoint: sp, At: now}); err != nil {
 		c.recordFaultLocked(now, err, "trajectory buffer rejected waypoint")
 		return protocol.MotorCommand{}, err
+	}
+
+	// 单目标命令成功入缓冲 => 明确切回单目标通路：退出流式运动（含排空
+	// 后的末点保持与任何未走完排队）、倍率复位 1.0。否则流排空后 Planner
+	// 会一直处于 holding 状态并在 Step 中“接管”下发，之后的单目标命令
+	// 虽然返回成功却永远发不出去。只在流确实活动时记录一次切换事件；
+	// 被拒的单目标命令走不到这里，因此不会破坏正在进行的流式保持/排队。
+	if c.planner.Active() {
+		queued := c.planner.Len()
+		c.planner.Deactivate()
+		detail := "stream path released by accepted single-target command; single-target path takes over output"
+		if queued > 0 {
+			detail = fmt.Sprintf("%s (%d queued stream point(s) discarded by mode switch)",
+				detail, queued)
+		}
+		c.recordFaultLocked(now,
+			fault.New(fault.CatComm, fault.SourceController, ReasonStreamReleasedByCommand,
+				"stream path released for single-target command"),
+			detail)
 	}
 	return protocol.MotorCommand{
 		Mode: sp.Mode, PositionRad: sp.PositionRad,

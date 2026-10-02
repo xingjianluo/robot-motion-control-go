@@ -185,169 +185,183 @@ func (p *Planner) Append(pt Point, now time.Time, startPos float64, known bool) 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	reject := func(reason, msg string) error {
+	// rejectLocked 只更新“观测计数/最近事件”，绝不触碰任何运动状态
+	// （队列/锚点/保持/倍率均保持拒绝前原样）：被拒的点只影响它自己。
+	rejectLocked := func(reason, msg string) error {
 		err := fault.New(fault.CatCommandReject, fault.SourceStream, reason, msg)
 		p.stats.Rejected++
 		p.noteLocked(now, reason)
 		return err
 	}
+	// rejectErrLocked 对校验子过程返回的既有 fault 做同样的“只记账”处理，
+	// 并原样把错误返回调用方（原因码保持可区分）。
+	rejectErrLocked := func(err error) error {
+		fe, ok := fault.As(err)
+		if !ok {
+			err = fault.New(fault.CatCommandReject, fault.SourceStream,
+				ReasonSegmentTooFast, err.Error())
+			fe, _ = fault.As(err)
+		}
+		p.stats.Rejected++
+		p.noteLocked(now, fe.Reason)
+		return err
+	}
 
 	if pt.PositionRad < p.cfg.MinPositionRad || pt.PositionRad > p.cfg.MaxPositionRad {
-		return reject(ReasonPositionOutOfLimit, fmt.Sprintf(
+		return rejectLocked(ReasonPositionOutOfLimit, fmt.Sprintf(
 			"stream point %.6f outside [%.6f, %.6f]",
 			pt.PositionRad, p.cfg.MinPositionRad, p.cfg.MaxPositionRad))
 	}
 	if !pt.At.After(now) {
-		return reject(ReasonLatePoint,
+		return rejectLocked(ReasonLatePoint,
 			"stream point timestamp must be strictly later than now (no overlap with current motion)")
 	}
 
-	// 上一段已排空后再续点：新段从 now 起算，而不是沿用上一段到达时刻，
-	// 否则段速核算会偏松。若仍处于“末点保持”，以保持点为新锚点并退出保持。
-	if !p.active && p.hasAnchor {
-		p.anchorAt = now
-		if p.holding {
-			p.anchorPos = p.holdPos
-			p.curPos = p.holdPos
-			p.holding = false
-		}
-	}
-	// 流从未启动：先用临时锚点参与段速核算，全部校验通过后才提交，
-	// 避免被拒绝的点污染运动记忆。
-	if !p.hasAnchor {
-		if !known {
-			startPos = 0
-		}
+	// 流从未启动时的候选起始位置；仅用于校验计算，提交成功后才写入锚点。
+	if !p.hasAnchor && !known {
+		startPos = 0
 	}
 
-	if n := len(p.pending); n > 0 {
-		tail := p.pending[n-1]
-		switch {
-		case pt.At.Before(tail.At):
-			return reject(ReasonBackwardsTime,
+	// 本次追加成功后将生效的“段前驱基点”。全部校验通过前只做计算，
+	// 绝不修改 holding/anchor/curPos 等运动记忆——尤其在末点保持期
+	// 喂入一个走不到的点时，拒绝后必须继续按保持点逐周期下发。
+	baseAt := now
+	basePos := startPos
+	resumeHold := false
+	switch {
+	case len(p.pending) > 0:
+		tail := p.pending[len(p.pending)-1]
+		baseAt, basePos = tail.At, tail.PositionRad
+		// 时间倒流先于同刻替换判定。
+		if pt.At.Before(tail.At) {
+			return rejectLocked(ReasonBackwardsTime,
 				"stream point timestamp earlier than last queued point")
-		case pt.At.Equal(tail.At):
-			// 同一执行时刻只允许一个目标：替换而非并存/报错/丢弃。
-			// 校验的是“前驱 -> 替换点”这一段（而不是尾点到自己，dt=0）。
-			if len(p.pending) >= 2 {
-				if err := p.checkSegmentLocked(p.pending[n-2], pt); err != nil {
-					p.stats.Rejected++
-					return err
-				}
-			} else if p.hasAnchor {
-				if err := p.checkSegmentLocked(
-					Point{At: p.anchorAt, PositionRad: p.anchorPos}, pt); err != nil {
-					p.stats.Rejected++
-					return err
-				}
-			}
-			p.pending[n-1] = pt
-			// 替换点与前驱的名义间隔（首点则相对锚点）。
-			var gapPrev time.Duration
-			var posPrev float64
-			if n >= 2 {
-				gapPrev = pt.At.Sub(p.pending[n-2].At)
-				posPrev = p.pending[n-2].PositionRad
-			} else {
-				gapPrev = pt.At.Sub(p.anchorAt)
-				posPrev = p.anchorPos
-			}
-			p.gaps[n-1] = gapPrev
-			if gs := gapPrev.Seconds(); gs > 0 {
-				p.cruise[n-1] = (pt.PositionRad - posPrev) / gs
-			} else {
-				p.cruise[n-1] = 0
-			}
-			p.stats.Replaced++
-			p.noteLocked(now, "same_timestamp_replaced")
-			return nil
 		}
+	case p.holding:
+		// 上一段排空后的末点保持期：新段从保持点起算、从 now 起算。
+		baseAt, basePos, resumeHold = now, p.holdPos, true
+	case p.hasAnchor:
+		baseAt, basePos = now, p.anchorPos
+	}
+	firstStart := !p.hasAnchor && !resumeHold
+
+	// 同一执行时刻的点 => 替换排队尾点。先完成全部校验，成功后才一次性
+	// 提交；拒绝时队列与保持状态原封不动（被拒点不改动任何既有状态）。
+	if len(p.pending) > 0 && pt.At.Equal(p.pending[len(p.pending)-1].At) {
+		n := len(p.pending)
+		var gapPrev time.Duration
+		var posPrev float64
+		if n >= 2 {
+			gapPrev = pt.At.Sub(p.pending[n-2].At)
+			posPrev = p.pending[n-2].PositionRad
+		} else if p.hasAnchor {
+			gapPrev = pt.At.Sub(p.anchorAt)
+			posPrev = p.anchorPos
+		}
+		if gapPrev > 0 {
+			if err := p.checkSegmentSpeedLocked(
+				Point{At: pt.At.Add(-gapPrev), PositionRad: posPrev}, pt,
+				(pt.PositionRad-posPrev)/gapPrev.Seconds()); err != nil {
+				return rejectErrLocked(err)
+			}
+		}
+		var cruiseNew float64
+		if gs := gapPrev.Seconds(); gs > 0 {
+			cruiseNew = (pt.PositionRad - posPrev) / gs
+		}
+		p.pending[n-1] = pt
+		p.gaps[n-1] = gapPrev
+		p.cruise[n-1] = cruiseNew
+		p.stats.Replaced++
+		p.noteLocked(now, "same_timestamp_replaced")
+		return nil
 	}
 
-	// 流从未启动：本次入队将以 (now,startPos) 建立锚点。
-	firstStart := !p.hasAnchor
-
-	prev, hasPrev := p.segmentAnchorLocked(now, startPos)
-	if hasPrev {
-		if err := p.checkSegmentLocked(prev, pt); err != nil {
-			p.stats.Rejected++
-			return err
-		}
-	}
-
+	// 容量策略：EvictOldest 时先在本地副本上完成“挤掉 + 合并段重新校验”，
+	// 任何一步不可行都直接拒绝，现有队列一个字节都不改。
+	evicted := false
 	if len(p.pending) >= p.cfg.Capacity {
 		switch p.cfg.FullPolicy {
 		case EvictOldest:
 			// 活动点 pending[0] 不能挤（会改变正在走的路径）；只能挤 pending[1]。
 			if len(p.pending) < 2 {
-				return reject(ReasonEvictInfeasible,
+				return rejectLocked(ReasonEvictInfeasible,
 					"only the active point remains; nothing safe to evict")
 			}
-			victim := p.pending[1]
 			trialP := append(append([]Point{}, p.pending[:1]...), p.pending[2:]...)
-			if err := p.checkSegmentLocked(trialP[0], trialP[1]); err != nil {
-				return reject(ReasonEvictInfeasible,
+			merged := p.gaps[1] + p.gaps[2]
+			ms := merged.Seconds()
+			if ms <= 0 {
+				return rejectLocked(ReasonEvictInfeasible,
+					"evicting oldest queued point would collapse segment time")
+			}
+			// 合并后新段的基准巡航速度 = 合并位移 / 合并时长，并必须可行。
+			mergedCruise := (trialP[1].PositionRad - trialP[0].PositionRad) / ms
+			if err := p.checkSegmentSpeedLocked(trialP[0], trialP[1], mergedCruise); err != nil {
+				return rejectLocked(ReasonEvictInfeasible,
 					"evicting oldest queued point would make remaining segment infeasible: "+err.Error())
 			}
-			// 合并被挤点两侧段：新 gap[1] = 旧 gap[1] + 旧 gap[2]。
-			merged := p.gaps[1] + p.gaps[2]
+			// 挤掉后新点相对“挤掉后的尾点（活动点）”这一段同样必须可行。
+			if err := p.checkSegmentLocked(trialP[len(trialP)-1], pt); err != nil {
+				return rejectLocked(ReasonEvictInfeasible,
+					"new point infeasible after oldest queued point evicted: "+err.Error())
+			}
 			trialG := append(append([]time.Duration{}, p.gaps[:1]...), p.gaps[2:]...)
 			trialG[1] = merged
-			// 合并后新段的基准巡航速度 = 合并位移 / 合并时长。
 			trialV := append(append([]float64{}, p.cruise[:1]...), p.cruise[2:]...)
-			if ms := merged.Seconds(); ms > 0 {
-				trialV[1] = (trialP[1].PositionRad - trialP[0].PositionRad) / ms
-			}
+			trialV[1] = mergedCruise
 			p.pending = trialP
 			p.gaps = trialG
 			p.cruise = trialV
-			p.stats.Evicted++
-			p.noteLocked(now, fmt.Sprintf("evicted_oldest_point_at=%v", victim.At))
+			evicted = true
 		default:
-			return reject(ReasonQueueFull, fmt.Sprintf(
+			return rejectLocked(ReasonQueueFull, fmt.Sprintf(
 				"stream queue at capacity %d", p.cfg.Capacity))
 		}
 	}
 
-	firstGap := pt.At.Sub(now)
-	var gapPrevAppend time.Duration
-	var posPrevAppend float64
-	if len(p.pending) == 0 {
-		gapPrevAppend = firstGap
-		posPrevAppend = startPos
-	} else {
-		gapPrevAppend = pt.At.Sub(p.pending[len(p.pending)-1].At)
-		posPrevAppend = p.pending[len(p.pending)-1].PositionRad
+	// 挤掉发生后，基点变为挤掉后的新尾点。
+	if evicted {
+		baseAt = p.pending[len(p.pending)-1].At
+		basePos = p.pending[len(p.pending)-1].PositionRad
 	}
+	// 普通追加段（基点 -> 新点）可行性。
+	if pt.At.After(baseAt) {
+		if err := p.checkSegmentLocked(Point{At: baseAt, PositionRad: basePos}, pt); err != nil {
+			return rejectErrLocked(err)
+		}
+	}
+
+	// ---- 全部校验通过，以下为唯一提交区：任何拒绝都不会走到这里 ----
+	gapPrevAppend := pt.At.Sub(baseAt)
 	var cruiseNew float64
 	if gs := gapPrevAppend.Seconds(); gs > 0 {
-		cruiseNew = (pt.PositionRad - posPrevAppend) / gs
+		cruiseNew = (pt.PositionRad - basePos) / gs
 	}
-	p.pending = append(p.pending, pt)
-	p.gaps = append(p.gaps, gapPrevAppend)
-	p.cruise = append(p.cruise, cruiseNew)
+	if resumeHold {
+		// 保持期续点：以保持点为新锚点并退出保持，保持期逐周期下发不中断。
+		p.anchorAt = now
+		p.anchorPos = p.holdPos
+		p.curPos = p.holdPos
+		p.holding = false
+	}
 	if firstStart {
-		// 流首次启动：提交锚点（校验全部通过后才写入，被拒点不污染记忆）。
+		// 流首次启动：校验全部通过后才建立锚点，被拒点不污染运动记忆。
 		p.hasAnchor = true
 		p.anchorAt = now
 		p.anchorPos = startPos
 		p.curPos = startPos
 	}
+	p.pending = append(p.pending, pt)
+	p.gaps = append(p.gaps, gapPrevAppend)
+	p.cruise = append(p.cruise, cruiseNew)
 	p.active = true
 	p.stats.Appended++
+	if evicted {
+		p.stats.Evicted++
+		p.noteLocked(now, "evicted_oldest_point")
+	}
 	return nil
-}
-
-// segmentAnchorLocked 返回新点段速核算的前驱：排队尾点优先，
-// 否则用流锚点（上一段到达点）；流从未启动时用起始候选点。
-func (p *Planner) segmentAnchorLocked(now time.Time, startPos float64) (Point, bool) {
-	if n := len(p.pending); n > 0 {
-		return p.pending[n-1], true
-	}
-	if p.hasAnchor {
-		return Point{At: p.anchorAt, PositionRad: p.anchorPos}, true
-	}
-	return Point{At: now, PositionRad: startPos}, true
 }
 
 // checkSegmentLocked 校验 from->to 段在当前倍率下不超速度、时长为正。
@@ -357,7 +371,20 @@ func (p *Planner) checkSegmentLocked(from, to Point) error {
 		return fault.New(fault.CatCommandReject, fault.SourceStream, ReasonLatePoint,
 			"segment duration must be positive")
 	}
-	speed := math.Abs(to.PositionRad-from.PositionRad) / dt * p.factor
+	baseCruise := (to.PositionRad - from.PositionRad) / dt
+	return p.checkSegmentSpeedLocked(from, to, baseCruise)
+}
+
+// checkSegmentSpeedLocked 按显式给出的【基准巡航速度】（倍率=1）与当前
+// 倍率核算 from->to 段速是否超限。挤掉合并段时合并巡航速度不等于按
+// from/to 时刻差反推的值，因此需要显式传入。
+func (p *Planner) checkSegmentSpeedLocked(from, to Point, baseCruise float64) error {
+	dt := to.At.Sub(from.At).Seconds()
+	if dt <= 0 {
+		return fault.New(fault.CatCommandReject, fault.SourceStream, ReasonLatePoint,
+			"segment duration must be positive")
+	}
+	speed := math.Abs(baseCruise) * p.factor
 	if speed > p.cfg.MaxVelocityRadS {
 		return fault.New(fault.CatCommandReject, fault.SourceStream, ReasonSegmentTooFast,
 			fmt.Sprintf("segment speed %.4f at factor %.2f exceeds max %.4f",
@@ -652,6 +679,17 @@ func ramp(cur, target, dvMax, maxVel float64) float64 {
 		v = -maxVel
 	}
 	return v
+}
+
+// Deactivate 退出流式运动（含排空后的末点保持）并回到干净空闲状态：
+// 清空排队与运动记忆、倍率复位 1.0。当一条单目标命令被成功接受时由
+// 控制器调用，表示本会话从“流式通路”明确切回“单目标通路”。
+//
+// 与 Reset 的区别只在语义：Reset 是安全动作（强制、留安全类记录），
+// Deactivate 是用户显式接管（正常模式切换）；二者对运动状态的清理一致，
+// 保证切回单目标后 Step 不再被流式保持期“接管”下发。
+func (p *Planner) Deactivate() {
+	p.Reset()
 }
 
 // Reset 清空排队与运动记忆，并把倍率恢复为 1.0（安全动作/恢复时调用，

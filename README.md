@@ -256,6 +256,47 @@ OverrideChanges/OverrideRejects/LastEvent`，内存占用永不超过容量。
   无观测证据时不反驳（由显式条件与人工确认负责），避免无证据误拒。
   该开关默认 `false`，**保持对既有调用方/用例的兼容**。
 
+### 4A.6 流式与单目标在同一会话里共存、来回切换
+
+两条通路可以在**同一会话中任意交替使用**，不会互相堵死：
+
+- 流式队列排空后进入**末点保持**，此时下发权仍在流式通路（持续下发
+  末点位置）。一旦一条**单目标命令通过全部校验并成功入轨迹缓冲**，
+  控制器立即让流式通路退出（清空排队/保持、倍率复位 1.0），下发权
+  交回单目标通路，并记录可观测事件
+  `communication_fault|controller|stream_released_by_command`。
+  此后 `SubmitCommand / Step` 的行为与“本会话从没跑过流式”完全一致；
+  再次喂流式点则从当前实际位置重新建立锚点，正常起步。
+- 因此“跑过一次流式之后单目标只返回成功却不动”的情况不会再发生：
+  模式切换由**成功接受的命令**显式驱动。
+- **被拒的单目标命令不影响流式**：非 RUN、越界、矛盾字段等拒绝发生在
+  入缓冲之前，流式保持/排队/倍率与下行连续性一律不变。
+- 若流仍在运动（队列非空）时成功接受单目标命令，该命令同样立即接管：
+  尚未走完的流式点被本次显式模式切换丢弃（计入上面的切换事件明细，
+  说明丢弃点数），不会在后面某个周期突然又冒出来。
+
+### 4A.7 被拒绝的流式点是“只读”的：绝不改动现有运动状态
+
+`Planner.Append` 的所有校验（硬限位、迟到/重叠、倒流、段速可行性、
+容量与挤掉可行性）**全部在任何状态写入之前完成**；唯一的提交区位于
+全部校验通过之后。因此一条被拒的点：
+
+- 不会退出末点保持：拒绝后的每个周期仍逐周期下发保持位置，不会出现
+  “拒绝后连续多个周期一条位置命令都没有”的空窗；
+- 不会修改已排队点、锚点、当前积分位置/速度、倍率与到达计数
+  （只增加 `StreamStats.Rejected` 与最近事件）；
+- 不会毒化后续：拒绝之后再喂合法点照常接续运动。
+
+两类“位置到不了”的拒绝在原因码上明确分开，便于调用方分别处理：
+
+| 情形 | 归类 | 含义 |
+|------|------|------|
+| 点本身合法，但**按当前状态**（当前保持位置/剩余时间/当前倍率）段速超过最大速度 | `command_rejected|stream|stream_segment_too_fast` | “这条现在走不出来”，安全状态保持 RUN、保持继续 |
+| 目标点超出硬位置范围（或在控制器预检中进入软限位带） | `command_rejected|stream|stream_position_out_of_limit`；控制器预检先命中时为 `safety|safety|soft_limit_violation` | “普通越界”，与运动可行性无关 |
+
+`evict_oldest` 策略同样如此：挤掉最旧点后若合并段或新段不可行，
+以 `stream_evict_infeasible` 拒绝且**现有队列一个字节都不改**。
+
 ---
 
 ## 5. 反馈消费：失联、乱序、跳变都不是“跟踪误差”
@@ -331,7 +372,7 @@ OverrideChanges/OverrideRejects/LastEvent`，内存占用永不超过容量。
 |----------|------|-----------|
 | `command_rejected` | 命令主动被拒（越界/矛盾/不安全） | `position_out_of_limit`、`accel_out_of_limit`、`stream_segment_too_fast`、`stream_queue_full`、`override_infeasible` … |
 | `protocol_error` | 帧到达但协议不接受 | `unknown_frame_type`、`missing_field`、`version_unsupported` … |
-| `communication_fault` | 链路问题 | `feedback_watchdog_timeout`、`queue_full_dropped`、`injected_frame_loss`、`position_jump`、`stream_drained` … |
+| `communication_fault` | 链路问题 | `feedback_watchdog_timeout`、`queue_full_dropped`、`injected_frame_loss`、`position_jump`、`stream_drained`、`stream_released_by_command` … |
 | `safety` | 安全联锁触发或恢复被拒 | `estop_pressed`、`torque_overload`、`recovery_denied`、`recovery_conditions_contradict_observation`、`stream_evicted_oldest` … |
 
 `Source` 进一步指明首次产生组件（trajectory/**stream**/protocol/bus/
@@ -362,6 +403,18 @@ make test           # 等价：go test ./... -race -count=1
   `override_infeasible`、排队 `reject_new`/`evict_oldest` 两种容量策略、
   运动/调速中触发安全停机后队列与倍率被确定性清空、恢复必须真实观测核验、
   以及 **200 周期 喂点/调速/急停/Step 四方并发 + race 检测**；
+- **流式/单目标共存与拒绝隔离**（`internal/control/coexist_test.go`、
+  `internal/stream/stream_test.go` 末尾两个用例）：流式排空保持后单目标
+  照常真实下发、单目标↔流式可来回切换；末点保持期喂“走不出来”的点
+  （`stream_segment_too_fast`）与普通越界（`stream_position_out_of_limit`
+  /`soft_limit_violation`）原因码分开、被拒后保持命令一周期不空、排队与
+  计数不变、合法续点照常恢复；被拒单目标不退掉进行中的流；挤掉不可行时
+  队列原样保留；
+- **端到端演示确定性**（`cmd/demo/main_test.go::TestDemoEndToEndDeterministic`）：
+  在测试进程内连续运行 3 次完整 12 段演示，断言**退出码 0、12 段全跑到、
+  输出逐字节一致**，且关键安全拒绝（outputs_disabled/recovery_denied/
+  torque_overload/recovery_conditions_contradict_observation 等）真实出现
+  ——演示不是靠放宽校验跑通的；
 - **反馈**：重复/乱序/跳变不污染基准、看门狗“失联≠偏差”、V1 兼容；
 - **安全**：优先级与抑制、急停恒赢、恢复条件全列举、软限位显式清除；
 - **控制器场景**（`internal/control/scenarios_test.go`）：
@@ -373,16 +426,34 @@ make test           # 等价：go test ./... -race -count=1
 ### 9.2 端到端演示
 
 ```bash
-make demo
+make demo            # 期望退出码 0；任何致命错误都会以非 0 退出
+go run ./cmd/demo; echo "exit=$?"   # 直接运行，期望 exit=0
 ```
+
+**稳定复现与确定性自检**：
+
+```bash
+go run ./cmd/demo > /tmp/run1.txt; echo $?   # 期望 0
+go run ./cmd/demo > /tmp/run2.txt; echo $?   # 期望 0
+cmp /tmp/run1.txt /tmp/run2.txt && echo OK   # 期望 OK：逐字节一致
+go test ./cmd/demo/ -run TestDemoEndToEndDeterministic -count=1  # 进程内自动复核
+```
+
+演示起始时刻、参数、设备/总线注入全部固定；第 11 段“并发急停”放在
+**独立 rig（不挂审计记录器）**上运行——goroutine 锁竞争只会改变被拒
+命令/处理周期的次数（锁保证的最终 ESTOP 与“急停后零新命令”恒定），
+这些随调度变化的计数被隔离在主审计流之外，因此主输出与审计 Dump
+**连跑两次逐字节一致、退出码恒为 0**。
 
 12 个场景顺序演示：上电 ESTOP 拒绝命令 → 条件不全拒绝恢复 → 满足条件+人工
 确认 → 连续速度轨迹与反馈闭环（1 rad/s×0.3s=0.3 rad，误差 0）→
 越界/矛盾命令被区分拒绝 → **连续流式三点拼接（0.1/0.3/0.2，不在点间停车，
 末点 0.20 精确保持）** → **在线倍率 50%→120%→暂停→100%（越界倍率被拒，
 末点 0.40 精确保持）** → 连续丢帧触发看门狗 COMM_LOSS → 链路自愈不自动
-复位 → 显式恢复 → 力矩超限 TORQUE_FAULT 锁存 → 缺人工确认被拒 → 恢复 →
-急停与周期/命令并发（最终必为 ESTOP 且无新命令）→ 积压/注入/抖动可观测性。
+复位 → 显式恢复（恢复前必须有一帧序号严格更大的真实健康观测，否则交叉
+核验照样拒绝） → 力矩超限 TORQUE_FAULT 锁存 → 缺人工确认被拒 → 恢复 →
+急停与周期/命令并发（独立 rig，最终必为 ESTOP 且无新命令）→
+积压/注入/抖动可观测性。
 连续运行 `make demo` 两次输出逐字节一致，便于稳定复现。
 
 ### 9.3 确定性与无外部依赖说明
