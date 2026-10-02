@@ -208,6 +208,13 @@ func (c *Controller) SubmitCommand(cmd trajectory.Command) (protocol.MotorComman
 		c.recordFaultLocked(now, err, "trajectory buffer rejected waypoint")
 		return protocol.MotorCommand{}, err
 	}
+	// 通路交接：若此前一段流式喂点已经走完并处于“末点保持”，单目标命令
+	// 一旦被接受，就把下发权交还给单目标通路——从下一个完整周期起，
+	// advanceTrajectoryLocked 不再被 planner 的保持状态挡住。
+	// 活动流（仍有排队点）不受影响：单目标命令先在轨迹缓冲里排队，
+	// 流排空后自然生效；命令被上面的任何校验拒绝时也不会走到这里，
+	// 因此被拒命令绝不可能破坏正在保持的状态。
+	c.planner.ReleaseHold()
 	return protocol.MotorCommand{
 		Mode: sp.Mode, PositionRad: sp.PositionRad,
 		VelocityRadS: sp.VelocityRadS, TorqueNm: sp.TorqueNm,
